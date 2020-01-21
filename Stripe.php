@@ -8,6 +8,7 @@ class Stripe {
 	}
 	function payment_button($params) {
 		global $billic, $db;
+		
 		$html = '';
 		if (get_config('stripe_secret_key') == '' || get_config('stripe_publishable_key') == '') {
 			return $html;
@@ -15,79 +16,110 @@ class Stripe {
 		if ($billic->user['verified'] == 0 && get_config('stripe_require_verification') == 1) {
 			return 'verify';
 		} else {
-			$html.= '<form action="http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/Gateway/Stripe/" method="POST">';
-			$html.= '<input type="hidden" name="billic_invoice" value="' . $params['invoice']['id'] . '">';
-			$html.= '<input type="hidden" name="billic_currency" value="' . get_config('billic_currency_code') . '">';
-			$html.= '<input type="hidden" name="billic_amount" value="' . ($params['charge'] * 100) . '">';
-			$html.= '<script src="https://checkout.stripe.com/checkout.js" class="stripe-button" data-key="' . get_config('stripe_publishable_key') . '" data-image="/i/theme_' . strtolower($GLOBALS['billic_theme']['name']) . '/logo.png" data-zip-code="true" data-name="' . get_config('billic_companyname') . '" data-description="Invoice #' . $params['invoice']['id'] . '" data-amount="' . ($params['charge'] * 100) . '" data-currency="' . get_config('billic_currency_code') . '" data-email="' . safe($billic->user['email']) . '"></script></form>';
+			$client_secret = null;
+			
+			// Check cache for a Client Secret
+			if (isset($_SESSION['stripe']) && is_array($_SESSION['stripe'])) {
+				foreach($_SESSION['stripe'] as $k => $sess) {
+					if ($sess['created']<(time()-3600)) {
+						unset($_SESSION['stripe'][$k]);
+						continue;
+					}
+					if ($sess['invoiceid']===$params['invoice']['id'] && $sess['currency']===get_config('billic_currency_code') && $sess['charge']===$params['charge'] && !empty($sess['client_secret'])) {
+						$client_secret = $sess['client_secret'];
+						break;
+					}
+				}
+			}
+
+			// Ask Stripe for a new Client Secret
+			if ($client_secret===null) {
+				$ch = curl_init();
+				curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+				curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 4);
+				curl_setopt($ch, CURLOPT_TIMEOUT, 6);
+				curl_setopt($ch, CURLOPT_HEADER, false);
+				curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+				curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+				curl_setopt($ch, CURLOPT_URL, 'https://api.stripe.com/v1/payment_intents');
+				curl_setopt($ch, CURLOPT_USERPWD, get_config('stripe_secret_key') . ':');
+				curl_setopt($ch, CURLOPT_POST, true);
+				curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
+					'amount' => ($params['charge'] * 100),
+					'currency' => get_config('billic_currency_code'),
+					'metadata' => ['invoiceid' => $params['invoice']['id']]
+				]));
+				$data = json_decode(curl_exec($ch), true);
+				if (!is_array($data)) return 'An error occurred while trying to communicate with Stripe';
+				$client_secret = $data['client_secret'];
+				
+				// Cache the client secret
+				if (!isset($_SESSION['stripe']) || !is_array($_SESSION['stripe']))
+					$_SESSION['stripe'] = [];
+				$_SESSION['stripe'][] = [
+					'created' => time(),
+					'invoiceid' => $params['invoice']['id'],
+					'currency' => get_config('billic_currency_code'),
+					'charge' => $params['charge'],
+					'client_secret' => $client_secret
+				];
+			}
+			$html .= '<script src="https://js.stripe.com/v3/"></script><script>var stripe = Stripe(\''.get_config('stripe_publishable_key').'\');var elements = stripe.elements();</script><button id="submit" class="btn btn-default float-right" onClick="stripePay()">Pay</button><div id="card-element" class="form-control" style="height: 2.4em; padding-top: .7em; width:250px;"></div><div id="card-errors" class="alert alert-danger" role="alert" style="display:none"></div><script>var card = elements.create("card");card.mount("#card-element");card.addEventListener(\'change\', ({error}) => { if (error) { $(\'#card-errors\').text(error.message).show();  } else {    $(\'#card-errors\').text(\'\').hide(); }}); function stripePay() { stripe.confirmCardPayment(\''.$client_secret.'\', { payment_method: { card: card, billing_details: { name: "'.addslashes($billic->user['firstname'].' '.$billic->user['lastname']).'" } } }).then(function(result) { if (result.error) { $(\'#card-errors\').text(result.error.message).show(); } else { if (result.paymentIntent.status === \'succeeded\') { $(location).attr(\'href\', \'http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/User/Invoices/ID/'.$params['invoice']['id'].'/Status/Completed/\'); } }}); }</script>';
 		}
 		return $html;
 	}
 	function payment_callback() {
 		global $billic, $db;
-		switch ($_POST['stripeTokenType']) {
-			case 'card':
-				if ($_POST['billic_amount'] <= 0) {
-					return 'Invalid amount';
-				}
-				if (empty($_POST['billic_invoice'])) {
+		$json = file_get_contents('php://input');
+		$data = json_decode($json, true);
+		if (!is_array($data))
+			return 'Invalid Request';
+		
+		$sig = $_SERVER['HTTP_STRIPE_SIGNATURE'];
+		$sig_pairs = explode(',', $sig);
+		$sig_arr = [];
+		foreach($sig_pairs as $pair) {
+			$pair = explode('=', $pair);
+			$sig_arr[$pair[0]] = $pair[1];
+		}
+		
+		$hash = hash_hmac('sha256', $sig_arr['t'].'.'.$json, get_config('stripe_endpoint_key'));
+		$hash_valid = false;
+		foreach($sig_arr as $k => $v) {
+			if ($hash===$v) {
+				$hash_valid = true;
+				break;
+			}
+		}
+		if (!$hash_valid)
+			return 'Unauthorized';
+		
+		if ($sig_arr['t']<(time()-3600))
+			return 'Timed out';
+		
+		switch ($data['type']) {
+			case 'charge.succeeded':
+				$invoiceid = $data['data']['object']['metadata']['invoiceid'];
+				if (empty($invoiceid))
 					return 'Invoice ID not provided';
-				}
-				$invoice = $db->q('SELECT * FROM `invoices` WHERE `id` = ?', $_POST['billic_invoice']);
-				$invoice = $invoice[0];
-				if (empty($invoice)) {
-					return 'Invoice "' . $_POST['billic_invoice'] . '" not found';
-				}
-				$post = array(
-					'amount' => $_POST['billic_amount'],
-					'currency' => $_POST['billic_currency'],
-					'card' => $_POST['stripeToken'],
-					'description' => 'Invoice #' . $invoice['id'],
-					'capture' => 'true',
-				);
-				$ch = curl_init();
-				curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-				curl_setopt($ch, CURLOPT_HEADER, false);
-				curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-				curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-				curl_setopt($ch, CURLOPT_URL, 'https://api.stripe.com/v1/charges');
-				curl_setopt($ch, CURLOPT_USERPWD, get_config('stripe_secret_key') . ':');
-				curl_setopt($ch, CURLOPT_POST, true);
-				curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($post));
-				$data = curl_exec($ch);
-				$err = curl_error($ch);
-				if (!empty($err)) {
-					return $err;
-				}
-				$json = json_decode($data, true);
-				if (!is_array($json)) {
-					return 'Invalid response from Stripe: ' . $data;
-				}
-				if (array_key_exists('error', $json)) {
-					return 'Stripe Error: ' . $json['error']['message'];
-				}
-				if ($json['livemode'] === false && get_config('stripe_allow_test_payments') == 0) {
+				$invoice = $db->q('SELECT * FROM `invoices` WHERE `id` = ?', $invoiceid)[0];
+				if (empty($invoice))
+					return 'Invoice "' . $invoiceid . '" not found';
+				
+				if ($data['livemode'] === false && get_config('stripe_allow_test_payments') == 0)
 					return 'Test mode is not allowed in your settings';
-				}
-				if ($json['paid'] != true) {
-					return 'Charge not paid';
-				}
+				
 				$billic->module('Invoices');
 				$return = $billic->modules['Invoices']->addpayment(array(
 					'gateway' => 'Stripe',
-					'invoiceid' => $_POST['billic_invoice'],
-					'amount' => ($_POST['billic_amount'] / 100) , // value is in cents
-					'currency' => $_POST['billic_currency'],
-					'transactionid' => $json['id'],
+					'invoiceid' => $invoice['id'],
+					'amount' => ($data['data']['object']['amount'] / 100) , // value is in cents
+					'currency' => $data['data']['object']['currency'],
+					'transactionid' => $data['id'],
 				));
-				if ($return === true) {
-					$billic->redirect('/User/Invoices/ID/' . $_POST['billic_invoice'] . '/Status/Complete/');
-				} else {
-					return $return;
-				}
 			break;
 			default:
-				return 'Unhandled stripeTokenType';
+				return 'Unhandled type';
 			break;
 		}
 	}
@@ -99,6 +131,7 @@ class Stripe {
 			echo '<tr><td>Require Verification</td><td><input type="checkbox" name="stripe_require_verification" value="1"' . (get_config('stripe_require_verification') == 1 ? ' checked' : '') . '></td></tr>';
 			echo '<tr><td>Secret Key</td><td><input type="text" class="form-control" name="stripe_secret_key" value="' . safe(get_config('stripe_secret_key')) . '"></td></tr>';
 			echo '<tr><td>Publishable Key</td><td><input type="text" class="form-control" name="stripe_publishable_key" value="' . safe(get_config('stripe_publishable_key')) . '"></td></tr>';
+			echo '<tr><td>Endpoint Signing Secret</td><td><input type="text" class="form-control" name="stripe_endpoint_key" value="' . safe(get_config('stripe_endpoint_key')) . '"></td></tr>';
 			echo '<tr><td>Allow Test Payments</td><td><input type="checkbox" name="stripe_allow_test_payments" value="1"' . (get_config('stripe_allow_test_payments') == 1 ? ' checked' : '') . '></td></tr>';
 			//echo '<tr><td colspan="2">You will need to setup a webhook to go to http'.(get_config('billic_ssl')==1?'s':'').'://'.get_config('billic_domain').'/Gateway/Stripe/</td></tr>';
 			echo '<tr><td colspan="2" align="center"><input type="submit" class="btn btn-default" name="update" value="Update &raquo;"></td></tr>';
@@ -108,6 +141,7 @@ class Stripe {
 				set_config('stripe_require_verification', $_POST['stripe_require_verification']);
 				set_config('stripe_secret_key', $_POST['stripe_secret_key']);
 				set_config('stripe_publishable_key', $_POST['stripe_publishable_key']);
+				set_config('stripe_endpoint_key', $_POST['stripe_endpoint_key']);
 				set_config('stripe_allow_test_payments', $_POST['stripe_allow_test_payments']);
 				$billic->status = 'updated';
 			}
