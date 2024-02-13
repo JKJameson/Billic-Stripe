@@ -75,7 +75,7 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'usage' => 'off_session'
 				]);
-				$client_secret = $setupIntent['client_secret'];
+				$client_secret = @$setupIntent['client_secret'];
 				if (empty($client_secret)) die('There was an error while fetching your information from our card processor. Please contact us.');
 
 				$this->js();
@@ -100,10 +100,10 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'description' => 'Invoice #'.$params['invoice']['id']
 				]);
-				
+
 				if (!is_array($paymentIntent))
 					$this->jsonErr($paymentIntent);
-				
+
 				echo json_encode(['client_secret' => $paymentIntent['client_secret']]);
 				break;
 		}
@@ -141,9 +141,11 @@ class Stripe {
 		}
 		if (isset($data['error'])) $error = 'Stripe returned an error ('.basename($url).'): '.$data['error']['message'];
 		if ($error!==null) {
-			if ($failOnError) die(safe($error));
-		} else {
-			return $error;
+			if ($failOnError) {
+				die(safe($error));
+			} else {
+				return $error;
+			}
 		}
 		return $data;
 	}
@@ -154,28 +156,29 @@ class Stripe {
 			return false;
 		if ($billic->user['verified'] == 0 && get_config('stripe_require_verification') == 1)
 			return 'verify';
-			
+
 		$cardData = $this->ch('https://api.stripe.com/v1/payment_methods', [
 			'customer' => $billic->user['stripe_customer_id'],
 			'type' => 'card'
-		], 'GET');
+		], 'GET', false);
+		if (!is_array($cardData)) {
+			if (strpos($cardData, 'No such customer')!==false) {
+				if ($_GET['SubAction']==='NewCustomer') return 'There was an error while trying to find your billing account.';
+				$db->q('UPDATE `users` SET `stripe_customer_id` = NULL WHERE `id` = ?', $billic->user['id']);
+				$billic->redirect('/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/SubAction/NewCustomer/');
+			}
+			return 'Stripe Error: '.safe($cardData);
+		}
 
 		$cards = [];
-		if (!empty($billic->user['stripe_customer_id'])) {				
+		if (!empty($billic->user['stripe_customer_id'])) {
 			$cardData = $this->ch('https://api.stripe.com/v1/payment_methods', [
 				'customer' => $billic->user['stripe_customer_id'],
 				'type' => 'card'
-			], 'GET');
+			], 'GET', false);
 			if (is_array($cardData)) {
 				foreach($cardData['data'] as $k => $source) {
 					$cards[] = $source;
-				}
-			} else {
-				if (strpos($cardData, 'No such customer')!==false) {
-					if ($_GET['SubAction']==='NewCustomer')
-						return 'There was an error while trying to find your billing account.';
-					$db->q('UPDATE `users` SET `stripe_customer_id` = \'\' WHERE `id` = ?', $billic->user['id']);
-					$billic->redirect('/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/SubAction/NewCustomer/');
 				}
 			}
 		}
