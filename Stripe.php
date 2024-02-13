@@ -75,7 +75,6 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'usage' => 'off_session'
 				]);
-
 				$client_secret = $setupIntent['client_secret'];
 				if (empty($client_secret)) die('There was an error while fetching your information from our card processor. Please contact us.');
 
@@ -114,7 +113,8 @@ class Stripe {
 		exit;
 	}
 	private $ch = null;
-	function ch($url, $post = false, $method = null) {
+	function ch($url, $post = false, $method = null, $failOnError = true) {
+		$error = null;
 		if ($this->ch===null) {
 			$this->ch = curl_init();
 			curl_setopt($this->ch, CURLOPT_SSL_VERIFYPEER, false);
@@ -130,9 +130,21 @@ class Stripe {
 			if ($method!==null) curl_setopt($this->ch, CURLOPT_CUSTOMREQUEST, $method); else curl_setopt($this->ch, CURLOPT_POST, true);
 			curl_setopt($this->ch, CURLOPT_POSTFIELDS, http_build_query($post));
 		} else curl_setopt($this->ch, CURLOPT_POST, false);
-		$data = json_decode(curl_exec($this->ch), true);
-		if (!is_array($data)) return 'An error occurred while trying to communicate with Stripe';
-		if (isset($data['error'])) return 'Stripe returned an error ('.basename($url).'): '.$data['error']['message'];
+		$raw = curl_exec($this->ch);
+		$data = json_decode($raw, true);
+		if (!is_array($data)) {
+			if ($raw===false) {
+				$error = 'Stripe cURL Error: ('.curl_errno($this->ch).') '.curl_error($this->ch);
+			} else {
+				$error = 'An error occurred while trying to communicate with Stripe';
+			}
+		}
+		if (isset($data['error'])) $error = 'Stripe returned an error ('.basename($url).'): '.$data['error']['message'];
+		if ($error!==null) {
+			if ($failOnError) die(safe($error));
+		} else {
+			return $error;
+		}
 		return $data;
 	}
 	function payment_button($params) {
