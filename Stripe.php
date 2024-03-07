@@ -75,7 +75,8 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'usage' => 'off_session'
 				]);
-				$client_secret = @$setupIntent['client_secret'];
+
+				$client_secret = $setupIntent['client_secret'];
 				if (empty($client_secret)) die('There was an error while fetching your information from our card processor. Please contact us.');
 
 				$this->js();
@@ -100,11 +101,25 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'description' => 'Invoice #'.$params['invoice']['id']
 				]);
-
+				
 				if (!is_array($paymentIntent))
 					$this->jsonErr($paymentIntent);
-
+				
 				echo json_encode(['client_secret' => $paymentIntent['client_secret']]);
+				break;
+			case 'RemovePaymentMethod':
+				$billic->disable_content();
+				$paymentmethodid = $_POST['payment_method'];
+				
+				preg_match('~^pm_([a-zA-Z0-9]+)$~', $paymentmethodid, $match);
+				if (empty($paymentmethodid) || $match[0]!==$paymentmethodid)
+					$this->jsonErr('Invalid card selected');
+				
+				$resp = $this->ch('https://api.stripe.com/v1/payment_methods/'.$paymentmethodid.'/detach', []);
+				if (!is_array($resp))
+					$this->jsonErr($resp);
+				
+				echo json_encode(['status' => 'ok']);
 				break;
 		}
 	}
@@ -113,8 +128,7 @@ class Stripe {
 		exit;
 	}
 	private $ch = null;
-	function ch($url, $post = false, $method = null, $failOnError = true) {
-		$error = null;
+	function ch($url, $post = false, $method = null) {
 		if ($this->ch===null) {
 			$this->ch = curl_init();
 			curl_setopt($this->ch, CURLOPT_SSL_VERIFYPEER, false);
@@ -130,23 +144,9 @@ class Stripe {
 			if ($method!==null) curl_setopt($this->ch, CURLOPT_CUSTOMREQUEST, $method); else curl_setopt($this->ch, CURLOPT_POST, true);
 			curl_setopt($this->ch, CURLOPT_POSTFIELDS, http_build_query($post));
 		} else curl_setopt($this->ch, CURLOPT_POST, false);
-		$raw = curl_exec($this->ch);
-		$data = json_decode($raw, true);
-		if (!is_array($data)) {
-			if ($raw===false) {
-				$error = 'Stripe cURL Error: ('.curl_errno($this->ch).') '.curl_error($this->ch);
-			} else {
-				$error = 'An error occurred while trying to communicate with Stripe';
-			}
-		}
-		if (isset($data['error'])) $error = 'Stripe returned an error ('.basename($url).'): '.$data['error']['message'];
-		if ($error!==null) {
-			if ($failOnError) {
-				die(safe($error));
-			} else {
-				return $error;
-			}
-		}
+		$data = json_decode(curl_exec($this->ch), true);
+		if (!is_array($data)) return 'An error occurred while trying to communicate with Stripe';
+		if (isset($data['error'])) return 'Stripe returned an error ('.basename($url).'): '.$data['error']['message'];
 		return $data;
 	}
 	function payment_button($params) {
@@ -156,29 +156,28 @@ class Stripe {
 			return false;
 		if ($billic->user['verified'] == 0 && get_config('stripe_require_verification') == 1)
 			return 'verify';
-
+			
 		$cardData = $this->ch('https://api.stripe.com/v1/payment_methods', [
 			'customer' => $billic->user['stripe_customer_id'],
 			'type' => 'card'
-		], 'GET', false);
-		if (!is_array($cardData)) {
-			if (strpos($cardData, 'No such customer')!==false) {
-				if ($_GET['SubAction']==='NewCustomer') return 'There was an error while trying to find your billing account.';
-				$db->q('UPDATE `users` SET `stripe_customer_id` = NULL WHERE `id` = ?', $billic->user['id']);
-				$billic->redirect('/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/SubAction/NewCustomer/');
-			}
-			return 'Stripe Error: '.safe($cardData);
-		}
+		], 'GET');
 
 		$cards = [];
-		if (!empty($billic->user['stripe_customer_id'])) {
+		if (!empty($billic->user['stripe_customer_id'])) {				
 			$cardData = $this->ch('https://api.stripe.com/v1/payment_methods', [
 				'customer' => $billic->user['stripe_customer_id'],
 				'type' => 'card'
-			], 'GET', false);
+			], 'GET');
 			if (is_array($cardData)) {
 				foreach($cardData['data'] as $k => $source) {
 					$cards[] = $source;
+				}
+			} else {
+				if (strpos($cardData, 'No such customer')!==false) {
+					if ($_GET['SubAction']==='NewCustomer')
+						return 'There was an error while trying to find your billing account.';
+					$db->q('UPDATE `users` SET `stripe_customer_id` = \'\' WHERE `id` = ?', $billic->user['id']);
+					$billic->redirect('/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/SubAction/NewCustomer/');
 				}
 			}
 		}
@@ -190,6 +189,7 @@ class Stripe {
 		$fullName = addslashes($billic->user['firstname'].' '.$billic->user['lastname']);
 		$postcode = $this->simplify_postcode($billic->user['postcode']);
 		$invoicePaidURL = 'http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/User/Invoices/ID/'.$params['invoice']['id'].'/Status/Completed/';
+		$invoicePayURL = 'http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/';
 
 		echo <<<EOF
 <script>
@@ -204,6 +204,7 @@ function payUsingCard(btn) {
 
 	btn.text('Please Wait...');
 	$('.btn-stripe-pay').prop('disabled', true);
+	$('.btn-stripe-remove').prop('disabled', false).text('Remove');
 
 	$.ajax({
 	  type: "POST",
@@ -215,6 +216,7 @@ function payUsingCard(btn) {
 	  	if (typeof data.error !== 'undefined') {
 			$('#card-errors').text(data.error).show();
 			$('.btn-stripe-pay').prop('disabled', false).text('Pay');
+			$('.btn-stripe-remove').prop('disabled', false).text('Remove');
 		} else {
 			stripe.confirmCardPayment(data.client_secret, {
 				payment_method: payment_method
@@ -222,12 +224,43 @@ function payUsingCard(btn) {
 				if (result.error) {
 					$('#card-errors').text(result.error.message).show();
 					$('.btn-stripe-pay').prop('disabled', false).text('Pay');
+					$('.btn-stripe-remove').prop('disabled', false).text('Remove');
 				} else {
 					if (result.paymentIntent.status === 'succeeded') {
 						$(location).attr('href', '$invoicePaidURL');
 					}
 				}
 			});
+		}
+	  },
+	  dataType: 'json'
+	});
+}
+function removeCard(btn) {
+	$('#card-errors').text('').hide();
+
+	var cardlastfour = btn.attr('cardlastfour');
+	if (!confirm('Are you sure you want to remove the card ending in '+cardlastfour+'?'))
+		return false;
+	var payment_method = btn.attr('paymentmethod');
+
+	btn.text('Please Wait...');
+	$('.btn-stripe-pay').prop('disabled', true);
+	$('.btn-stripe-remove').prop('disabled', true);
+
+	$.ajax({
+	  type: "POST",
+	  url: 'Module/Stripe/SubAction/RemovePaymentMethod/',
+	  data: {
+	  	payment_method: payment_method,
+	  },
+	  success: function(data) {
+		if (typeof data.error !== 'undefined') {
+			$('#card-errors').text(data.error).show();
+			$('.btn-stripe-pay').prop('disabled', false).text('Pay');
+			$('.btn-stripe-remove').prop('disabled', false).text('Remove');
+		} else {
+			$(location).attr('href', '$invoicePayURL');
 		}
 	  },
 	  dataType: 'json'
@@ -271,6 +304,7 @@ EOF;
 
 				$btn = '<button class="btn btn-success btn-sm btn-stripe-pay" cardlastfour="'.safe($card['card']['last4']).'" paymentmethod="'.safe($card['id']).'" onClick="payUsingCard($(this))">Pay</button>';
 				if ($cardError!==false) $btn = $cardError;
+				$btn .= '&nbsp;<button class="btn btn-danger btn-sm btn-stripe-remove" cardlastfour="'.safe($card['card']['last4']).'" paymentmethod="'.safe($card['id']).'" onClick="removeCard($(this))">Remove</button>';
 
 				echo '<tr><td>'.$brand.'</td><td>'.$number.'</td><td>'.$expiry.'</td><td>'.$btn.'</td></tr>';
 			}
