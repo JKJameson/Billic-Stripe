@@ -99,7 +99,8 @@ class Stripe {
 					'metadata' => ['invoiceid' => $params['invoice']['id']],
 					'payment_method' => $paymentmethodid,
 					'customer' => $billic->user['stripe_customer_id'],
-					'description' => 'Invoice #'.$params['invoice']['id']
+					'description' => 'Invoice #'.$params['invoice']['id'],
+					'return_url' => 'http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/',
 				]);
 				
 				if (!is_array($paymentIntent))
@@ -379,6 +380,7 @@ EOF;
 					'currency' => $data['data']['object']['currency'],
 					'transactionid' => $data['id'],
 				));
+				return true;
 				break;
 			case 'setup_intent.succeeded':
 				if ($data['data']['object']['usage']==='off_session') {
@@ -396,12 +398,14 @@ EOF;
 					$this->ch('https://api.stripe.com/v1/payment_methods/'.$paymentMethodID.'/attach', [
 						'customer' => $user['stripe_customer_id']
 					]);
+					return true;
 				}
 				break;
 			default:
 				return 'Unhandled type';
 			break;
 		}
+		return 'Unhandled message';
 	}
 	function settings($array) {
 		global $billic, $db;
