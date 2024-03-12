@@ -101,6 +101,7 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'description' => 'Invoice #'.$params['invoice']['id'],
 					'return_url' => 'http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/',
+					'confirm' => true,
 				]);
 				
 				if (!is_array($paymentIntent))
