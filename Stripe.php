@@ -101,7 +101,7 @@ class Stripe {
 					'customer' => $billic->user['stripe_customer_id'],
 					'description' => 'Invoice #'.$params['invoice']['id'],
 					'return_url' => 'http' . (get_config('billic_ssl') == 1 ? 's' : '') . '://' . get_config('billic_domain') . '/User/Invoices/ID/'.$params['invoice']['id'].'/Action/Pay/',
-					'confirm' => true,
+					'confirm' => 'true',
 				]);
 				
 				if (!is_array($paymentIntent))
@@ -373,14 +373,13 @@ EOF;
 		
 		switch ($data['type']) {
 			case 'charge.succeeded':
-				$billic->module('Invoices');
-				$return = $billic->modules['Invoices']->addpayment(array(
+				$return = $billic->module('Invoices', 'addpayment', [
 					'gateway' => 'Stripe',
 					'invoiceid' => $invoice['id'],
 					'amount' => ($data['data']['object']['amount'] / 100) , // value is in cents
 					'currency' => $data['data']['object']['currency'],
 					'transactionid' => $data['id'],
-				));
+				]);
 				return true;
 				break;
 			case 'setup_intent.succeeded':
